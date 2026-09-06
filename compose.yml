@@ -1,0 +1,196 @@
+name: redis-cluster-lab
+
+x-redis-node: &redis-node
+  image: redis:8.10
+  restart: unless-stopped
+  networks:
+    - redis-cluster
+
+networks:
+  redis-cluster:
+    driver: bridge
+
+services:
+  # Шесть нод кластера.
+  #
+  # Клиентские порты публикуются на хост, чтобы можно было выполнять
+  # диагностические команды напрямую (CLUSTER INFO, CLUSTER NODES,
+  # DBSIZE, CLUSTER KEYSLOT) - они не требуют следования за редиректами.
+  #
+  # Шинные порты (17000-17005) НЕ публикуются: вся межнодовая связь
+  # остаётся внутри docker-сети. Это принципиально - именно вынос
+  # шины и репликации на хост ломал кластер после failover.
+  redis-node-1:
+    <<: *redis-node
+    hostname: redis-node-1
+    ports:
+      - "7000:7000"
+    volumes:
+      - ./nodes/7000:/redis:ro
+    command: redis-server /redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7000", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  redis-node-2:
+    <<: *redis-node
+    hostname: redis-node-2
+    ports:
+      - "7001:7001"
+    volumes:
+      - ./nodes/7001:/redis:ro
+    command: redis-server /redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7001", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  redis-node-3:
+    <<: *redis-node
+    hostname: redis-node-3
+    ports:
+      - "7002:7002"
+    volumes:
+      - ./nodes/7002:/redis:ro
+    command: redis-server /redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7002", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  redis-node-4:
+    <<: *redis-node
+    hostname: redis-node-4
+    ports:
+      - "7003:7003"
+    volumes:
+      - ./nodes/7003:/redis:ro
+    command: redis-server /redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7003", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  redis-node-5:
+    <<: *redis-node
+    hostname: redis-node-5
+    ports:
+      - "7004:7004"
+    volumes:
+      - ./nodes/7004:/redis:ro
+    command: redis-server /redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7004", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  redis-node-6:
+    <<: *redis-node
+    hostname: redis-node-6
+    ports:
+      - "7005:7005"
+    volumes:
+      - ./nodes/7005:/redis:ro
+    command: redis-server /redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7005", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # Одноразовый контейнер: собирает кластер и проверяет результат.
+  cluster-init:
+    image: redis:8.10
+    restart: "no"
+    networks:
+      - redis-cluster
+    volumes:
+      - ./scripts/create-cluster.sh:/create-cluster.sh:ro
+    entrypoint: ["sh", "/create-cluster.sh"]
+    depends_on:
+      redis-node-1:
+        condition: service_healthy
+      redis-node-2:
+        condition: service_healthy
+      redis-node-3:
+        condition: service_healthy
+      redis-node-4:
+        condition: service_healthy
+      redis-node-5:
+        condition: service_healthy
+      redis-node-6:
+        condition: service_healthy
+
+  # Cluster-aware прокси. Держит у себя топологию (CLUSTER SLOTS)
+  # и сам отрабатывает редиректы MOVED и ASK, поэтому снаружи кластер
+  # выглядит как обычный одиночный Redis на порту 6379.
+  envoy:
+    image: envoyproxy/envoy:v1.36-latest
+    restart: unless-stopped
+    networks:
+      - redis-cluster
+    ports:
+      - "6379:6379"
+      - "9901:9901"
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "warn"]
+    # В образе Envoy нет curl (базовый Ubuntu), поэтому проверяем
+    # средствами bash: принимает ли прокси соединения на клиентском
+    # порту. Нужен именно CMD с явным bash - /bin/sh в Ubuntu это dash,
+    # а он /dev/tcp не поддерживает.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6379"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    depends_on:
+      cluster-init:
+        condition: service_completed_successfully
+
+  redisinsight:
+    image: redis/redisinsight:latest
+    restart: unless-stopped
+    ports:
+      - "5540:5540"
+    networks:
+      - redis-cluster
+    volumes:
+      - redisinsight_data:/data
+    depends_on:
+      cluster-init:
+        condition: service_completed_successfully
+
+  # Python-песочница внутри docker-сети. Нужна для примеров,
+  # которым требуется настоящий кластерный клиент.
+  # Запуск: docker compose --profile client up -d
+  client:
+    build: .
+    image: redis-cluster-lab-client:2.0.0
+    restart: unless-stopped
+    profiles: ["client"]
+    networks:
+      - redis-cluster
+    volumes:
+      - ./app:/app
+      - ./scripts:/scripts
+    command: ["sleep", "infinity"]
+    depends_on:
+      cluster-init:
+        condition: service_completed_successfully
+
+volumes:
+  redisinsight_data:
